@@ -1,918 +1,747 @@
-import asyncio
-import json
-import os
 import re
-from datetime import datetime
-from typing import Dict, Any, List
-
+import os
+import json
+import asyncio
+import logging
+import httpx
 import phonenumbers
-import requests
-from phonenumbers import geocoder
-from telegram import (
-    __version__ as PTB_VERSION,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-    ChatMember,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ChatMemberHandler,
-)
-from telegram.error import BadRequest, Forbidden
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
-BOT_TOKEN = "8715229700:AAGA1mtLxD0whIMoZGGvzjLp83ghmjz_CVI"
-BOT_USERNAME = "zerotimeotp_bot"
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
+from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
+# ======================== CONFIGURATION ========================
+BOT_TOKEN = "8715229700:AAFj7_LOwbQt4J_OAs7ubQH_EUMGL8lb1LI"
+ADMIN_IDS = [8661200480, 8927512671]
+
 DATA_DIR = "data"
-LOGS_DIR = os.path.join(DATA_DIR, "logs")
-STATES_DIR = os.path.join(DATA_DIR, "states")
-
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
 APIS_FILE = os.path.join(DATA_DIR, "apis.json")
-CHATS_FILE = os.path.join(DATA_DIR, "chats.json")
-OWNERS_FILE = os.path.join(DATA_DIR, "owners.json")
+BUTTONS_FILE = os.path.join(DATA_DIR, "buttons.json")
+ICON_FILE = os.path.join(DATA_DIR, "icon.txt")
+LINKED_CHANNELS_FILE = os.path.join(DATA_DIR, "linked_channels.json")
 
-DEFAULT_OWNERS = [8927512671]
-FETCH_INTERVAL = 3
+# Global fallback emoji IDs
+ID_GLOBAL_SERVICE_FALLBACK = "6026092115631543342"
+ID_GLOBAL_FLAG_FALLBACK = "6025908467124932460"
+ID_PREMIUM_DOT = "5972022360025336988"
 
-FIXED_BUTTON_3_NAME = "👑 Owner"
-FIXED_BUTTON_3_URL = "https://t.me/zeronumbars"
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+router = Router()
 
-FIXED_BUTTON_4_NAME = "🪀 Whatsapp"
-FIXED_BUTTON_4_URL = "https://chat.whatsapp.com/LwPIdOAbtmnBUhSr0qbNxg?mode=wwt"
-
-DEFAULT_BUTTON_1_NAME = "🔢 Numbers"
-DEFAULT_BUTTON_1_URL = "https://t.me/zeronumbars"
-
-DEFAULT_BUTTON_2_NAME = "ZeroTraceNums"
-DEFAULT_BUTTON_2_URL = "https://t.me/zeronumbars1"
-
-OWNER_STATE_API_URL = 1
-OWNER_STATE_ADD_OWNER = 2
-OWNER_STATE_ACTIVATE_GROUP = 4
-OWNER_STATE_DEACTIVATE_GROUP = 5
-OWNER_STATE_MANAGE_BUTTONS_ID = 6
-OWNER_STATE_MANAGE_BUTTONS_1_NAME = 7
-OWNER_STATE_MANAGE_BUTTONS_1_URL = 8
-OWNER_STATE_MANAGE_BUTTONS_2_NAME = 9
-OWNER_STATE_MANAGE_BUTTONS_2_URL = 10
-
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR, exist_ok=True)
-os.makedirs(STATES_DIR, exist_ok=True)
-
+http_client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
 json_lock = asyncio.Lock()
 
-def safe_load_json(path, default):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default, f, indent=2)
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except:
-            return default
+# Caches
+groups_cache: List[str] = []
+apis_cache: List[Dict[str, Any]] = []
+buttons_cache: List[Dict[str, Any]] = []
+api_records_cache: Dict[int, set] = {}
+linked_channels_cache: Dict[str, str] = {}  # key: group_chat_id, value: channel_link
 
-apis = safe_load_json(APIS_FILE, [])
-chats = {k: v for k, v in safe_load_json(CHATS_FILE, {}).items() if v.get("type") == "group"}
-owners = safe_load_json(OWNERS_FILE, DEFAULT_OWNERS)
+# Icon mappings
+service_icons: Dict[str, str] = {}
+flag_icons: Dict[str, str] = {}
 
-api_tasks: Dict[int, asyncio.Task] = {}
+# Premium custom emojis (HTML tags) - صرف میسج ٹیکسٹ کے لیے
+E_CROWN = '<tg-emoji emoji-id="5467406098367521267">👑</tg-emoji>'
+E_GEAR  = '<tg-emoji emoji-id="5424818078833715060">⚙️</tg-emoji>'
+E_TICK  = '<tg-emoji emoji-id="5895458739703517004">✅</tg-emoji>'
+E_CROSS = '<tg-emoji emoji-id="5852812849780362931">❌</tg-emoji>'
+E_LOAD1 = '<tg-emoji emoji-id="5971972727383264364">🔸</tg-emoji>'
+E_LOAD2 = '<tg-emoji emoji-id="5971816626796892111">🔹</tg-emoji>'
+E_LOAD3 = '<tg-emoji emoji-id="5972124077735807885">🔸</tg-emoji>'
+E_LOAD4 = '<tg-emoji emoji-id="5971837680726576448">🔹</tg-emoji>'
+E_HEART = '<tg-emoji emoji-id="6023924329673135034">❤️</tg-emoji>'
+E_OK    = '<tg-emoji emoji-id="6023773095284707791">👌</tg-emoji>'
+E_DASH  = '<tg-emoji emoji-id="6298356878573307709">➖</tg-emoji>'
+E_OTP   = '<tg-emoji emoji-id="6298717844804733009">🔑</tg-emoji>'
+E_CHANNEL = '<tg-emoji emoji-id="5282843764451195532">🔗</tg-emoji>'
 
-async def write_json(path, data):
-    async with json_lock:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+# Custom emoji IDs for buttons
+ID_ADD    = "6033108614724456536"
+ID_MANAGE = "5197269100878907942"
+ID_COPY   = "5472308992514464048"
+ID_LINK   = "5282843764451195532"
+ID_ADMIN  = "5467406098367521267"
+ID_BACK   = "5253997076169115797"
+ID_TRASH  = "5372825386591732174"
+ID_TOGGLE = "6066348702363031988"
+ID_TICK   = "5895458739703517004"
+ID_CROSS  = "5852812849780362931"
 
-async def save_apis():
-    await write_json(APIS_FILE, apis)
+# new for api id
+E_DIGITS = {
+    '0': '<tg-emoji emoji-id="5778597459877957448">0️⃣</tg-emoji>',
+    '1': '<tg-emoji emoji-id="5778325047282241647">1️⃣</tg-emoji>',
+    '2': '<tg-emoji emoji-id="5778507987119247519">2️⃣</tg-emoji>',
+    '3': '<tg-emoji emoji-id="5778355910917231510">3️⃣</tg-emoji>',
+    '4': '<tg-emoji emoji-id="5778496953348264834">4️⃣</tg-emoji>',
+    '5': '<tg-emoji emoji-id="5778429230303941569">5️⃣</tg-emoji>',
+    '6': '<tg-emoji emoji-id="5778634662884676303">6️⃣</tg-emoji>',
+    '7': '<tg-emoji emoji-id="5778650382464979758">7️⃣</tg-emoji>',
+    '8': '<tg-emoji emoji-id="5778572626377052504">8️⃣</tg-emoji>',
+    '9': '<tg-emoji emoji-id="5778317599808950144">9️⃣</tg-emoji>',
+    '.': '.'
+}
 
-async def save_chats():
-    groups_only = {k: v for k, v in chats.items() if v.get("type") == "group"}
-    await write_json(CHATS_FILE, groups_only)
+# ======================== FSM STATES ========================
+class BotStates(StatesGroup):
+    wait_btn_name = State()
+    wait_btn_url = State()
+    wait_api_name = State()
+    wait_api_url = State()
 
-async def save_owners():
-    await write_json(OWNERS_FILE, owners)
-
-def get_api_seen_file(api_id):
-    """File that stores the list of unique signatures (hashes) of processed OTPs."""
-    return os.path.join(STATES_DIR, f"api_{api_id}_seen.json")
-
-def get_api_log_file(api_id):
-    """Human readable log file."""
-    return os.path.join(LOGS_DIR, f"api_{api_id}_history.txt")
-
-def load_seen_signatures(api_id) -> List[str]:
-    """Loads the list of already processed message signatures from file."""
-    path = get_api_seen_file(api_id)
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
-    except:
-        return []
-
-def save_seen_signatures(api_id, signatures: List[str]):
-    """Saves the updated list of signatures to file."""
-    path = get_api_seen_file(api_id)
-    
-    if len(signatures) > 1000:
-        signatures = signatures[-1000:]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(signatures, f, indent=2, ensure_ascii=False)
-
-def append_to_api_log(api_id, record):
-    """Appends the message to a text file log."""
-    path = get_api_log_file(api_id)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = (
-        f"[{timestamp}] Time: {record.get('time')} | "
-        f"Num: {record.get('number')} | "
-        f"Msg: {record.get('message')}\n"
-        f"{'-'*40}\n"
-    )
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-    except Exception as e:
-        print(f"Failed to write log for API {api_id}: {e}")
-
-def create_signature(record: dict) -> str:
-    """Creates a unique string for a message to detect duplicates."""
-    
-    return f"{record.get('time')}|{record.get('number')}|{record.get('message')}"
-
-def extract_otp(message: str) -> str:
-    for pat in [r'\d{3}-\d{3}', r'\d{6}', r'\d{4}']:
-        m = re.search(pat, message)
-        if m:
-            return m.group(0)
-    return "N/A"
-
-def mask_number(number_str: str) -> str:
-    try:
-        if not number_str.startswith("+"):
-            number_str = f"+{number_str}"
-        length = len(number_str)
-        if length < 10:
-            show_first = 4
-            show_last = 2
+# ======================== ICON PARSER ========================
+def parse_icon_file():
+    global service_icons, flag_icons
+    default_text = """
+    Facebook = 5778227624539067802
+    Snapchat = 5778362190159419841
+    WhatsApp = 5778576341523765178
+    Tiktok = 5778262705831942198
+    chrome = 5778264788891080241
+    Telegram = 5778372665584654472
+    🇵🇰 = 5269660289321679111
+    🇺🇸 = 5202021044105257611
+    """
+    content = default_text
+    if os.path.exists(ICON_FILE):
+        with open(ICON_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        key, val = [part.strip() for part in line.split("=", 1)]
+        if any(ord(char) > 127 for char in key):
+            flag_icons[key] = val
         else:
-            show_first = 5
-            show_last = 4
-        stars_len = length - show_first - show_last
-        if stars_len < 0:
-            return number_str
-        stars = '*' * stars_len
-        return f"{number_str[:show_first]}{stars}{number_str[-show_last:]}"
-    except:
-        return number_str
+            service_icons[key.lower()] = val
 
-def get_country_info_from_number(number_str: str):
+# ======================== PHONE HELPERS ========================
+def get_country_flag_character(number_str: str) -> str:
     try:
         if not number_str.startswith("+"):
             number_str = f"+{number_str}"
         parsed = phonenumbers.parse(number_str)
-        country_name = geocoder.description_for_number(parsed, "en")
         region_code = phonenumbers.region_code_for_number(parsed)
-        flag = "🌍"
-        if region_code and len(region_code) == 2 and region_code.isalpha():
+        if region_code:
             base = 127462 - ord("A")
-            flag_char1 = chr(base + ord(region_code[0].upper()))
-            flag_char2 = chr(base + ord(region_code[1].upper()))
-            flag = flag_char1 + flag_char2
-        display_name = country_name if country_name else (region_code or "Unknown")
-        return display_name, flag
+            return chr(base + ord(region_code[0])) + chr(base + ord(region_code[1]))
     except Exception:
-        return "Unknown", "🌍"
+        pass
+    return "🌍"
 
-def create_message_markup(chat_id_str: str) -> InlineKeyboardMarkup:
-    chat_meta = chats.get(chat_id_str, {})
-    custom_buttons = chat_meta.get("buttons", [])
-    
-    kb_row1 = []
-    
-    btn1_name = custom_buttons[0].get("name", DEFAULT_BUTTON_1_NAME) if len(custom_buttons) > 0 else DEFAULT_BUTTON_1_NAME
-    btn1_url = custom_buttons[0].get("url", DEFAULT_BUTTON_1_URL) if len(custom_buttons) > 0 else DEFAULT_BUTTON_1_URL
-    kb_row1.append(InlineKeyboardButton(btn1_name, url=btn1_url))
+def get_premium_flag_emoji_tag(number_str: str) -> str:
+    flag_char = get_country_flag_character(number_str)
+    emoji_id = flag_icons.get(flag_char)
+    if emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">{flag_char}</tg-emoji>'
+    return f'<tg-emoji emoji-id="{ID_GLOBAL_FLAG_FALLBACK}">🌍</tg-emoji>'
 
-    btn2_name = custom_buttons[1].get("name", DEFAULT_BUTTON_2_NAME) if len(custom_buttons) > 1 else DEFAULT_BUTTON_2_NAME
-    btn2_url = custom_buttons[1].get("url", DEFAULT_BUTTON_2_URL) if len(custom_buttons) > 1 else DEFAULT_BUTTON_2_URL
-    kb_row1.append(InlineKeyboardButton(btn2_name, url=btn2_url))
+def get_premium_service_emoji_tag(service_name: str) -> str:
+    clean_name = service_name.strip().lower()
+    emoji_id = service_icons.get(clean_name)
+    if emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">📱</tg-emoji>'
+    return f'<tg-emoji emoji-id="{ID_GLOBAL_SERVICE_FALLBACK}">⚙️</tg-emoji>'
 
-    kb_row2 = [
-        InlineKeyboardButton(FIXED_BUTTON_3_NAME, url=FIXED_BUTTON_3_URL),
-        InlineKeyboardButton(FIXED_BUTTON_4_NAME, url=FIXED_BUTTON_4_URL),
-    ]
-
-    return InlineKeyboardMarkup([kb_row1, kb_row2])
-
-def format_message(record: dict, source_id: int, chat_id_str: str):
-    raw = record.get("message", "")
-    otp = extract_otp(raw)
-    msg = raw.replace("<", "&lt;").replace(">", "&gt;")
-
-    country_name, flag = get_country_info_from_number(record.get("number", ""))
-    formatted_number = mask_number(record.get("number", ""))
-
-    service_icon = "📱"
-    s = (record.get("service") or "").lower()
-    if "whatsapp" in s:
-        service_icon = "🟢"
-    elif "telegram" in s:
-        service_icon = "🔵"
-    elif "facebook" in s:
-        service_icon = "📘"
-
-    text = f"""
-<b>{source_id} {flag} New {country_name} {record.get('service','Service')} OTP!</b>
-
-<blockquote>🕰 Time: {record.get('time','')}</blockquote>
-<blockquote>{flag} Country: {country_name}</blockquote>
-<blockquote>{service_icon} Service: {record.get('service','')}</blockquote>
-<blockquote>📞 Number: {formatted_number}</blockquote>
-<blockquote>🔑 OTP: <code>{otp}</code></blockquote>
-
-<blockquote>📩 Full Message:</blockquote>
-<pre>{msg}</pre>
-
-<b>Powered By Kami_Broken😈
-Owner By ᴢᴇʀᴏᴛʀᴀᴄᴇɴᴜᴍs</b>
-"""
-    return text, create_message_markup(chat_id_str)
-
-def fetch_valid_otps_sync(api_url: str) -> List[dict]:
-    """Fetches all valid records from the API, returns list of dicts."""
+def mask_number_premium(number_str: str) -> str:
     try:
-        resp = requests.get(api_url, timeout=10)
-        data = resp.json()
-        records = data.get("aaData", [])
-        
-        valid_records = []
-        for r in records:
-            
-            if isinstance(r, list) and len(r) >= 5 and isinstance(r[0], str) and ":" in r[0]:
-                valid_records.append({
-                    "time": r[0],
-                    "country": r[1],
-                    "number": r[2],
-                    "service": r[3],
-                    "message": r[4],
-                })
-        
-        return valid_records
-    except Exception as e:
-        print(f"fetch error {api_url}: {e}")
-        return []
-
-async def api_worker(app: Application, api_obj: dict):
-    api_id = api_obj["id"]
-    url = api_obj["url"]
-    
-    
-    seen_signatures = load_seen_signatures(api_id)
-    
-    print(f"[WORKER STARTED] API-{api_id} -> {url}")
-    
-    while True:
-        
-        current_api_state = next((a for a in apis if a["id"] == api_id), None)
-        if not current_api_state or not current_api_state.get("active", True):
-            await asyncio.sleep(FETCH_INTERVAL)
-            continue
-            
-        loop = asyncio.get_running_loop()
-        
-        records = await loop.run_in_executor(None, fetch_valid_otps_sync, url)
-        
-        
-        new_items_found = False
-        
-        
-        for record in reversed(records):
-            sig = create_signature(record)
-            
-            
-            if sig not in seen_signatures:
-                for chat_id_str, meta in list(chats.items()):
-                    try:
-                        chat_id = int(chat_id_str)
-                    except:
-                        continue
-                    
-                    if not meta.get("active", True) or meta.get("type") != "group":
-                        continue
-                    
-                    text, markup = format_message(record, api_id, chat_id_str)
-                    
-                    
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=text,
-                                reply_markup=markup,
-                                parse_mode="HTML",
-                                read_timeout=20,
-                                write_timeout=20,
-                            )
-                            break
-                        except asyncio.TimeoutError:
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(2)
-                            else:
-                                print(f"Failed to send to {chat_id}: Timeout")
-                        except Exception as e:
-                            print(f"Failed to send to {chat_id}: {e}")
-                            break
-
-                
-                seen_signatures.append(sig)
-                
-                
-                append_to_api_log(api_id, record)
-                
-                new_items_found = True
-                print(f"[{datetime.now()}] API-{api_id} sent NEW OTP: {record.get('number')}")
-
-        
-        if new_items_found:
-            save_seen_signatures(api_id, seen_signatures)
-
-        await asyncio.sleep(FETCH_INTERVAL)
-
-async def ensure_workers(app: Application):
-    for api_obj in apis:
-        api_id = api_obj["id"]
-        
-        if api_id in api_tasks and api_tasks[api_id].done():
-            api_tasks[api_id].cancel()
-            del api_tasks[api_id]
-        
-        if api_id not in api_tasks:
-            api_tasks[api_id] = asyncio.create_task(api_worker(app, api_obj))
-
-def main_keyboard():
-    kb = [
-        [InlineKeyboardButton("🔑 Manage OTPs", callback_data="manage_otps")],
-        [InlineKeyboardButton("🛠 Manage Buttons", callback_data="manage_buttons")],
-        [InlineKeyboardButton("🔧 Owner Panel", callback_data="owner_panel")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-def manage_otps_keyboard():
-    kb = [
-        [InlineKeyboardButton("🟢 Activate OTPs", callback_data="otps_activate_start")],
-        [InlineKeyboardButton("🔴 Deactivate OTPs", callback_data="otps_deactivate_start")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-def owner_panel_keyboard():
-    kb = [
-        [InlineKeyboardButton("➕ Add New API", callback_data="owner_add_api")],
-        
-        [InlineKeyboardButton("➕ Add New Owner", callback_data="owner_add_owner")],
-        [InlineKeyboardButton("🔁 List APIs", callback_data="owner_list_apis")],
-        [InlineKeyboardButton("🗂 Manage Groups", callback_data="owner_list_chats")],
-        [InlineKeyboardButton("❌ Close", callback_data="close")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-async def owner_chats_list_markup(bot_obj) -> InlineKeyboardMarkup:
-    kb = []
-    for chat_id_str, meta in list(chats.items()):
-        try:
-            chat_id = int(chat_id_str)
-            chat = await bot_obj.get_chat(chat_id)
-            title = chat.title or f"Chat ID: {chat_id}"
-            active = meta.get("active", True)
-            label = f"{title} ({'🟢' if active else '🔴'})"
-            kb.append([InlineKeyboardButton(label, callback_data=f"owner_chat_details|{chat_id_str}")])
-        except (BadRequest, Forbidden):
-            continue
-        except Exception:
-            continue
-            
-    if not kb:
-        kb = [[InlineKeyboardButton("No groups are being managed.", callback_data="noop")]]
-        
-    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="owner_panel")])
-    return InlineKeyboardMarkup(kb)
-
-async def owner_chat_details_markup(chat_id_str: str, bot_obj):
-    chat_id = int(chat_id_str)
-    try:
-        chat_info = await bot_obj.get_chat(chat_id)
-        chat_title = chat_info.title
+        clean_num = re.sub(r'\D', '', number_str)
+        if len(clean_num) >= 8:
+            first_four = clean_num[:4]
+            last_four = clean_num[-4:]
+            premium_dots = f'<tg-emoji emoji-id="{ID_PREMIUM_DOT}">••••</tg-emoji>'
+            return f"+{first_four}{premium_dots}{last_four}"
     except Exception:
-        chat_title = "Unknown Group (ID Only)"
-        
-    meta = chats.get(chat_id_str, {"active": False})
-    status = meta.get("active", False)
-    
-    kb = [
-        [InlineKeyboardButton(f"{'Deactivate 🔴' if status else 'Activate 🟢'}", 
-                              callback_data=f"owner_chat_action|{chat_id_str}|{'deactivate' if status else 'activate'}")],
-        [InlineKeyboardButton("🗑 Delete Group", callback_data=f"owner_chat_action|{chat_id_str}|delete")],
-        [InlineKeyboardButton("⬅️ Back to List", callback_data="owner_list_chats")],
-    ]
-    
-    status_text = f"Group: <b>{chat_title}</b>\nID: <code>{chat_id_str}</code>\nStatus: {'🟢 Active' if status else '🔴 Deactivated'}"
-    
-    return InlineKeyboardMarkup(kb), status_text
+        pass
+    return number_str
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"[DEBUG-HANDLER] /start received from User ID: {update.effective_user.id}")
-    await ensure_workers(context.application)
-    await update.effective_chat.send_message("Welcome — choose an action:", reply_markup=main_keyboard())
+# ======================== JSON HANDLERS ========================
+def load_json_sync(file_path: str, default_value: Any) -> Any:
+    if not os.path.exists(file_path):
+        return default_value
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default_value
 
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
-    global apis 
-
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    user = query.from_user
-
-    print(f"[DEBUG-HANDLER] Callback received: {data} from User ID: {user.id}")
-
-    context.user_data.pop("conv_state", None)
-
-    if data == "manage_buttons":
-        if user.id not in owners:
-            await query.edit_message_text("Access denied. Only owners can manage buttons.")
-            return
-
-        context.user_data["conv_state"] = OWNER_STATE_MANAGE_BUTTONS_ID
-        await query.edit_message_text(
-            "<b>🛠 Button Management:</b>\n\n"
-            "Please send the <b>Group Chat ID</b> (e.g., <code>-1001234567890</code>) to manage its custom buttons (Button 1 & 2).\n"
-            "<b>Note:</b> You must be an <b>Owner</b> or <b>Admin</b> in the group, and the bot must be an <b>Admin</b> there too."
-            , parse_mode='HTML'
-        )
-        return
-
-    if data == "manage_otps":
-        if user.id not in owners:
-            await query.edit_message_text("Access denied. Only owners can manage OTP settings.")
-            return
-        await query.edit_message_text("Manage OTP Status:", reply_markup=manage_otps_keyboard())
-        return
-
-    if data == "otps_activate_start":
-        if user.id not in owners:
-            await query.edit_message_text("Access denied. Only owners can manage OTP settings.")
-            return
-        context.user_data["conv_state"] = OWNER_STATE_ACTIVATE_GROUP
-        await query.edit_message_text(
-            "<b>🟢 Activation Mode:</b>\n\n"
-            "Please send the <b>Group Chat ID</b> (e.g., <code>-1001234567890</code>) where you want to <b>Activate</b> OTP forwarding. "
-            "Ensure the bot is already an <b>Admin</b> in that group.",
-            parse_mode='HTML'
-        )
-        return
-
-    if data == "otps_deactivate_start":
-        if user.id not in owners:
-            await query.edit_message_text("Access denied. Only owners can manage OTP settings.")
-            return
-        context.user_data["conv_state"] = OWNER_STATE_DEACTIVATE_GROUP
-        await query.edit_message_text(
-            "<b>🔴 Deactivation Mode:</b>\n\n"
-            "Please send the <b>Group Chat ID</b> (e.g., <code>-1001234567890</code>) where you want to <b>Deactivate</b> OTP forwarding.",
-            parse_mode='HTML'
-        )
-        return
-
-    if data == "owner_panel":
-        if user.id not in owners:
-            await query.edit_message_text("Owner Panel — Access denied. You are not an owner.")
-            return
-        await query.edit_message_text("Owner Panel — choose:", reply_markup=owner_panel_keyboard())
-        return
-        
-    if data == "owner_list_chats":
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        markup = await owner_chats_list_markup(context.bot)
-        await query.edit_message_text("All Managed Groups (Owner only):", reply_markup=markup)
-        return
-
-    if data.startswith("owner_chat_details|"):
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        _, chat_id_str = data.split("|", 1)
-        if chat_id_str not in chats:
-            await query.edit_message_text("Error: Group not found.", reply_markup=await owner_chats_list_markup(context.bot))
-            return
-            
-        markup, status_text = await owner_chat_details_markup(chat_id_str, context.bot)
-        await query.edit_message_text(status_text, parse_mode='HTML', reply_markup=markup)
-        return
-
-    if data.startswith("owner_chat_action|"):
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        _, chat_id_str, action = data.split("|", 2)
-        
-        if chat_id_str not in chats:
-            await query.edit_message_text("Group not found.", reply_markup=await owner_chats_list_markup(context.bot))
-            return
-            
-        if action == 'delete':
-            del chats[chat_id_str]
-            await save_chats()
-            await query.edit_message_text(f"Group ID <code>{chat_id_str}</code> has been <b>deleted</b> from management.", parse_mode='HTML', reply_markup=await owner_chats_list_markup(context.bot))
-            return
-            
-        elif action in ('activate', 'deactivate'):
-            chats[chat_id_str]["active"] = (action == 'activate')
-            await save_chats()
-            
-            markup, status_text = await owner_chat_details_markup(chat_id_str, context.bot)
-            status_update = "Active" if action == 'activate' else "Deactivated"
-            await query.edit_message_text(f"Status changed to <b>{status_update}</b>.\n\n{status_text}", parse_mode='HTML', reply_markup=markup)
-            return
-    
-    if data == "owner_add_api":
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        context.user_data["conv_state"] = OWNER_STATE_API_URL
-        await query.edit_message_text("Send me the API URL (JSON endpoint). Example:\n<code>https://domain.tld/api/sms?type=sms</code>\n\nSend as plain text in chat.", parse_mode='HTML')
-        return
-        
-    if data == "owner_add_owner":
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        context.user_data["conv_state"] = OWNER_STATE_ADD_OWNER
-        await query.edit_message_text("Send me the <b>numeric ID</b> of the new owner.", parse_mode='HTML')
-        return
-
-    if data == "owner_list_apis":
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        await query.edit_message_text("APIs:", reply_markup=apis_list_markup())
-        return
-        
-    if data.startswith("api_details|"):
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        _, sid_str = data.split("|", 1)
-        sid = int(sid_str)
-        api_obj = next((a for a in apis if a["id"] == sid), None)
-        if not api_obj:
-             await query.edit_message_text("API not found.", reply_markup=owner_panel_keyboard())
-             return
-        
-        status_text = "🟢 Active" if api_obj.get("active", True) else "🔴 Deactivated"
-        await query.edit_message_text(f"API-{sid} Details:\nURL: <code>{api_obj['url']}</code>\nStatus: {status_text}", parse_mode='HTML', reply_markup=api_details_markup(sid))
-        return
-
-    if data.startswith("api_toggle|"):
-        if user.id not in owners: await query.edit_message_text("Access denied."); return
-        _, sid_str, action = data.split("|", 2)
-        sid = int(sid_str)
-        changed = False
-        for a in apis:
-            if a["id"] == sid:
-                a["active"] = (action == 'activate')
-                changed = True
-                break
-        if changed:
-            await save_apis()
-            await ensure_workers(context.application) 
-            api_obj = next((a for a in apis if a["id"] == sid), None)
-            status_text = "🟢 Active" if api_obj.get("active", True) else "🔴 Deactivated"
-            await query.edit_message_text(f"Toggled API-{sid}. New Status: {status_text}", reply_markup=api_details_markup(sid))
-        else:
-            await query.edit_message_text("API not found.", reply_markup=owner_panel_keyboard())
-        return
-
-    
-    if data.startswith("api_delete|"):
-        if user.id not in owners:
-            await query.edit_message_text("Access denied.")
-            return
-        
-        _, sid_str = data.split("|", 1)
-        sid = int(sid_str)
-        
-        
-        new_list = [a for a in apis if a["id"] != sid]
-        
-        if len(new_list) == len(apis):
-             await query.edit_message_text(f"API-{sid} not found to delete.", reply_markup=apis_list_markup())
-             return
-
-        apis = new_list
-        await save_apis()
-        
-        
-        if sid in api_tasks:
-            api_tasks[sid].cancel()
-            del api_tasks[sid]
-            
-        await query.edit_message_text(f"✅ API-{sid} has been deleted successfully.", reply_markup=apis_list_markup())
-        return
-    
-
-    if data == "owner_panel_back" or data == "back_main":
-        await query.edit_message_text("Back to main menu:", reply_markup=main_keyboard())
-        return
-
-    if data == "close":
-        await query.edit_message_text("Menu closed. Choose an action:", reply_markup=main_keyboard())
-        return
-
-    if data == "noop":
-        await query.answer("—")
-        return
-
-    await query.edit_message_text("Unknown action.", reply_markup=main_keyboard())
-
-
-async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
-    global apis, chats, owners
-    
-
-    user = update.effective_user
-    txt = (update.message.text or "").strip()
-    conv_state = context.user_data.get("conv_state")
-    
-    print(f"[DEBUG-HANDLER] Text message received: '{txt}' from User ID: {user.id}. Conv State: {conv_state}")
-
-    if conv_state and user.id in owners:
-        
-        if conv_state == OWNER_STATE_API_URL:
-            if not (txt.startswith("http://") or txt.startswith("https://")):
-                await update.message.reply_text("Please send a valid http(s) URL.")
-                return
-            new_id = max([a["id"] for a in apis], default=0) + 1
-            api_obj = {"id": new_id, "url": txt, "active": True}
-            apis.append(api_obj)
-            await save_apis()
-            context.user_data.pop("conv_state")
-            await ensure_workers(context.application)
-            await update.message.reply_text(f"Added API-{new_id}: <code>{txt}</code>\nWorker started.", parse_mode='HTML', reply_markup=owner_panel_keyboard())
-            return
-            
-        elif conv_state == OWNER_STATE_ADD_OWNER:
-            try:
-                new_owner_id = int(txt)
-                if new_owner_id in owners:
-                    await update.message.reply_text("This ID is already an owner.")
-                else:
-                    owners.append(new_owner_id)
-                    await save_owners()
-                    await update.message.reply_text(f"Added new owner with ID: <code>{new_owner_id}</code>.", parse_mode='HTML', reply_markup=owner_panel_keyboard())
-            except ValueError:
-                await update.message.reply_text("Invalid ID. Please send a numeric User ID.")
-            
-            context.user_data.pop("conv_state")
-            return
-            
-        elif conv_state == OWNER_STATE_MANAGE_BUTTONS_ID:
-            try:
-                group_id = int(txt)
-                group_id_str = str(group_id)
-                
-                if group_id >= 0:
-                    await update.message.reply_text("Invalid Group ID. Group IDs are typically negative.")
-                    context.user_data.pop("conv_state")
-                    return
-                
-                bot_member: ChatMember = await context.bot.get_chat_member(group_id, context.bot.id)
-                if bot_member.status not in ("administrator", "creator"):
-                    await update.message.reply_text("Error: Please make me <b>Admin</b> first in this group.", parse_mode='HTML')
-                    context.user_data.pop("conv_state")
-                    return
-
-                is_user_owner = user.id in owners
-                is_user_admin = False
-                if not is_user_owner:
-                    user_member: ChatMember = await context.bot.get_chat_member(group_id, user.id)
-                    is_user_admin = user_member.status in ("administrator", "creator")
-                
-                if not is_user_owner and not is_user_admin:
-                    await update.message.reply_text("Error: Only <b>Owner</b> or <b>Group Admins</b> can use this function.", parse_mode='HTML')
-                    context.user_data.pop("conv_state")
-                    return
-                
-                context.user_data["current_group_id"] = group_id_str
-                context.user_data["conv_state"] = OWNER_STATE_MANAGE_BUTTONS_1_NAME
-                
-                chats.setdefault(group_id_str, {"active": False, "type": "group"}) 
-                if "buttons" not in chats[group_id_str] or len(chats[group_id_str]["buttons"]) < 2:
-                    chats[group_id_str]["buttons"] = [
-                        {"name": DEFAULT_BUTTON_1_NAME, "url": DEFAULT_BUTTON_1_URL},
-                        {"name": DEFAULT_BUTTON_2_NAME, "url": DEFAULT_BUTTON_2_URL},
-                    ]
-                    await save_chats()
-                
-                await update.message.reply_text(
-                    "Group ID validated. Send the <b>Name</b> for <b>Button 1</b> now.", parse_mode='HTML'
-                )
-                return
-                
-            except ValueError:
-                await update.message.reply_text("Invalid input. Please send a valid numeric Group ID.")
-                context.user_data.pop("conv_state")
-                return
-            except Exception as e:
-                await update.message.reply_text(f"An error occurred during verification. Error: {e}")
-                context.user_data.pop("conv_state")
-                return
-
-        elif conv_state == OWNER_STATE_MANAGE_BUTTONS_1_NAME:
-            context.user_data["button_1_name"] = txt
-            context.user_data["conv_state"] = OWNER_STATE_MANAGE_BUTTONS_1_URL
-            await update.message.reply_text("Now send the <b>URL</b> for <b>Button 1</b>.", parse_mode='HTML')
-            return
-
-        elif conv_state == OWNER_STATE_MANAGE_BUTTONS_1_URL:
-            context.user_data["button_1_url"] = txt
-            context.user_data["conv_state"] = OWNER_STATE_MANAGE_BUTTONS_2_NAME
-            await update.message.reply_text("Now send the <b>Name</b> for <b>Button 2</b>.", parse_mode='HTML')
-            return
-
-        elif conv_state == OWNER_STATE_MANAGE_BUTTONS_2_NAME:
-            context.user_data["button_2_name"] = txt
-            context.user_data["conv_state"] = OWNER_STATE_MANAGE_BUTTONS_2_URL
-            await update.message.reply_text("Finally, send the <b>URL</b> for <b>Button 2</b>.", parse_mode='HTML')
-            return
-
-        elif conv_state == OWNER_STATE_MANAGE_BUTTONS_2_URL:
-            group_id_str = context.user_data.get("current_group_id")
-            
-            button_1_name = context.user_data.get("button_1_name")
-            button_1_url = context.user_data.get("button_1_url")
-            button_2_name = context.user_data.get("button_2_name")
-            button_2_url = context.user_data.get("button_2_url", txt) 
-            
-            if not all([group_id_str, button_1_name, button_1_url, button_2_name, button_2_url]):
-                await update.message.reply_text("Error: Missing button data. Please start the button management process again.", reply_markup=main_keyboard())
-                context.user_data.clear()
-                return
-
-            chats[group_id_str]["buttons"] = [
-                {"name": button_1_name, "url": button_1_url},
-                {"name": button_2_name, "url": button_2_url},
-            ]
-            await save_chats()
-            
-            await update.message.reply_text(
-                f"Buttons for Group ID <code>{group_id_str}</code> updated successfully! Choose an action:",
-                parse_mode='HTML',
-                reply_markup=main_keyboard()
-            )
-            
-            context.user_data.clear()
-            return
-
-    if conv_state in (OWNER_STATE_ACTIVATE_GROUP, OWNER_STATE_DEACTIVATE_GROUP):
-        
-        action_name = "Active" if conv_state == OWNER_STATE_ACTIVATE_GROUP else "Deactivated"
-        is_activation = conv_state == OWNER_STATE_ACTIVATE_GROUP
-        
+async def save_json_async(file_path: str, data: Any):
+    async with json_lock:
+        tmp_file = file_path + ".tmp"
         try:
-            group_id = int(txt)
-            group_id_str = str(group_id)
-            
-            if group_id >= 0:
-                await update.message.reply_text("Invalid Group ID. Group IDs are typically negative.")
-                context.user_data.pop("conv_state")
-                return
-
-            bot_member: ChatMember = await context.bot.get_chat_member(group_id, context.bot.id)
-            if bot_member.status not in ("administrator", "creator"):
-                await update.message.reply_text("Error: Please make me <b>Admin</b> first in this group.", parse_mode='HTML')
-                context.user_data.pop("conv_state")
-                return
-
-            is_user_owner = user.id in owners
-            is_user_admin = False
-            if not is_user_owner:
-                try:
-                    user_member: ChatMember = await context.bot.get_chat_member(group_id, user.id)
-                    is_user_admin = user_member.status in ("administrator", "creator")
-                except (Forbidden, BadRequest):
-                     is_user_admin = False
-            
-            if not is_user_owner and not is_user_admin:
-                await update.message.reply_text("Error: Only <b>Owner</b> or <b>Group Admins</b> can use this function/option.", parse_mode='HTML')
-                context.user_data.pop("conv_state")
-                return
-
-            chats.setdefault(group_id_str, {"active": is_activation, "type": "group"})
-            chats[group_id_str]["active"] = is_activation
-            
-            if "buttons" not in chats[group_id_str] or len(chats[group_id_str]["buttons"]) < 2:
-                 chats[group_id_str]["buttons"] = [
-                    {"name": DEFAULT_BUTTON_1_NAME, "url": DEFAULT_BUTTON_1_URL},
-                    {"name": DEFAULT_BUTTON_2_NAME, "url": DEFAULT_BUTTON_2_URL},
-                ]
-            
-            await save_chats()
-            
-            await update.message.reply_text(f"Group ID <code>{group_id}</code> has been <b>{action_name}</b> successfully! Choose an action:", parse_mode='HTML', reply_markup=main_keyboard())
-            
-        except ValueError:
-            await update.message.reply_text("Invalid input. Please send a valid numeric Group ID (e.g., <code>-1001234567890</code>).", parse_mode='HTML')
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_file, file_path)
         except Exception as e:
-            await update.message.reply_text(f"An error occurred during verification/update. Ensure the bot is an admin. Error: {e}")
-            
-        context.user_data.pop("conv_state")
+            logging.error(f"Error writing to {file_path}: {e}")
+
+def init_all_json_storage():
+    global groups_cache, apis_cache, buttons_cache, linked_channels_cache
+    os.makedirs(DATA_DIR, exist_ok=True)
+    groups_cache = load_json_sync(GROUPS_FILE, [])
+    apis_cache = load_json_sync(APIS_FILE, [])
+    buttons_cache = load_json_sync(BUTTONS_FILE, [])
+    linked_channels_cache = load_json_sync(LINKED_CHANNELS_FILE, {})
+    parse_icon_file()
+
+# ======================== RAW TELEGRAM API ========================
+async def send_raw_api_message(chat_id: Any, text: str, reply_markup: dict = None):
+    payload = {"chat_id": str(chat_id), "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        return await http_client.post(url, json=payload)
+    except Exception as e:
+        logging.error(f"send_raw_api_message error: {e}")
+
+async def edit_raw_api_message(chat_id: Any, message_id: int, text: str, reply_markup: dict = None):
+    payload = {"chat_id": str(chat_id), "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    try:
+        return await http_client.post(url, json=payload)
+    except Exception as e:
+        logging.error(f"edit_raw_api_message error: {e}")
+
+async def get_chat_info(chat_id: str) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
+    try:
+        resp = await http_client.post(url, json={"chat_id": chat_id})
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok"):
+                return data.get("result", {})
+    except Exception as e:
+        logging.error(f"getChat failed for {chat_id}: {e}")
+    return {}
+
+async def get_chat_member_status(chat_id: str, bot_id: int) -> str:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
+    try:
+        resp = await http_client.post(url, json={"chat_id": chat_id, "user_id": bot_id})
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok"):
+                return data["result"].get("status", "left")
+    except Exception:
+        pass
+    return "left"
+
+# ======================== LINKED CHANNEL TRACKING ========================
+async def update_linked_channels():
+    global linked_channels_cache
+    updated = False
+    for group_id in groups_cache:
+        info = await get_chat_info(group_id)
+        linked_id = info.get("linked_chat_id")
+        if linked_id:
+            channel_info = await get_chat_info(str(linked_id))
+            link = None
+            if channel_info.get("username"):
+                link = f"https://t.me/{channel_info['username']}"
+            else:
+                try:
+                    inv_link_resp = await http_client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/exportChatInviteLink", json={"chat_id": linked_id})
+                    if inv_link_resp.status_code == 200 and inv_link_resp.json().get("ok"):
+                        link = inv_link_resp.json()["result"]
+                except:
+                    link = None
+            if link:
+                if linked_channels_cache.get(group_id) != link:
+                    linked_channels_cache[group_id] = link
+                    updated = True
+            else:
+                if group_id in linked_channels_cache:
+                    del linked_channels_cache[group_id]
+                    updated = True
+        else:
+            if group_id in linked_channels_cache:
+                del linked_channels_cache[group_id]
+                updated = True
+    if updated:
+        await save_json_async(LINKED_CHANNELS_FILE, linked_channels_cache)
+
+async def verify_groups_presence():
+    global groups_cache
+    bot_info = await bot.get_me()
+    bot_id = bot_info.id
+    removed = False
+    for group_id in groups_cache[:]:
+        status = await get_chat_member_status(group_id, bot_id)
+        if status not in ["administrator", "member"]:
+            groups_cache.remove(group_id)
+            removed = True
+            linked_channels_cache.pop(group_id, None)
+    if removed:
+        await save_json_async(GROUPS_FILE, groups_cache)
+        await save_json_async(LINKED_CHANNELS_FILE, linked_channels_cache)
+
+# ======================== OTP CARD (ORIGINAL BUTTON VALUES RESTORED) ========================
+async def send_vip_card_direct(chat_id: str, norm_record: dict, custom_buttons_list: list, api_id: int):
+    service = norm_record.get("Service", "Unknown")
+    number = norm_record.get("Number", "N/A")
+    raw_msg = norm_record.get("Full_message", "")
+    
+    otp_match = re.search(r'\d{3}[-\s]?\d{3}|\d{4,8}', raw_msg)
+    otp = otp_match.group(0) if otp_match else "N/A"
+
+    service_emoji = get_premium_service_emoji_tag(service)
+    flag_emoji = get_premium_flag_emoji_tag(number)
+    masked_phone = mask_number_premium(number)
+
+    # Convert API ID to premium digit emojis
+    api_id_str = str(api_id)
+    api_id_emojis = "".join(E_DIGITS.get(char, char) for char in api_id_str)
+
+    text = (
+        f"{E_LOAD1}{E_LOAD1}{E_LOAD1}{E_LOAD1}{E_LOAD1}{E_LOAD1}{E_LOAD1}{E_LOAD1}{E_LOAD1}\n"
+        f"{api_id_emojis} New {service_emoji} OTP {E_HEART} Received {E_OK}\n"
+        f"{E_LOAD2}{E_LOAD2}{E_LOAD2}{E_LOAD2}{E_LOAD2}{E_LOAD2}{E_LOAD2}{E_LOAD2}{E_LOAD2}\n"
+        f"{flag_emoji} {E_DASH} {masked_phone}\n"
+        f"{E_OTP} {E_DASH} <code>{otp}</code>\n"
+        f"{E_LOAD3}{E_LOAD3}{E_LOAD3}{E_LOAD3}{E_LOAD3}{E_LOAD3}{E_LOAD3}{E_LOAD3}{E_LOAD3}\n"
+        f"<pre>Message \n{raw_msg}\n</pre>"
+        f"{E_LOAD4}{E_LOAD4}{E_LOAD4}{E_LOAD4}{E_LOAD4}{E_LOAD4}{E_LOAD4}{E_LOAD4}{E_LOAD4}"
+    )
+
+    inline_keyboard = []
+
+    # Copy button (original fields kept completely intact)
+    inline_keyboard.append([{
+        "text": f"Copy: {otp}",
+        "copy_text": {"text": otp},
+        "icon_custom_emoji_id": ID_COPY,
+        "style": "success"
+    }])
+
+    # Auto channel button
+    channel_link = linked_channels_cache.get(chat_id)
+    if channel_link:
+        inline_keyboard.append([{
+            "text": "Numbers",
+            "url": channel_link,
+            "icon_custom_emoji_id": ID_LINK,
+            "style": "primary"
+        }])
+
+    # Custom buttons (two per row)
+    for i in range(0, len(custom_buttons_list), 2):
+        row = []
+        for btn in custom_buttons_list[i:i+2]:
+            row.append({
+                "text": btn["name"],
+                "url": btn["url"],
+                "icon_custom_emoji_id": ID_LINK,
+                "style": "danger"
+            })
+        if row:
+            inline_keyboard.append(row)
+
+    await send_raw_api_message(chat_id, text, {"inline_keyboard": inline_keyboard})
+
+# ======================== STARTUP TEST FUNCTION ========================
+async def check_apis_on_startup():
+    logging.info("🚀 Startup sequence initiated: Fetching and verifying all pipelines...")
+    if not apis_cache:
         return
 
-    await update.message.reply_text("Use /start to open menu.")
+    current_buttons = [{"name": b["name"], "url": b["url"]} for b in buttons_cache]
+    active_apis = [api for api in apis_cache if api.get("is_active") == 1]
 
+    for api in active_apis:
+        api_id = api["id"]
+        try:
+            # 5-second fast timeout check on boot to prevent hanging
+            r = await http_client.get(api["url"], timeout=5.0)
+            if r.status_code != 200:
+                continue
 
+            data = r.json()
+            records = data.get("aaData", []) if isinstance(data, dict) else data
 
-async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cm = update.chat_member 
-    chat = cm.chat
-    chat_id = str(chat.id)
-    old_status = cm.old_chat_member.status
-    new_status = cm.new_chat_member.status
-    chat_type = chat.type
-    
-    if chat_type not in ("group", "supergroup"):
+            if not isinstance(records, list) or len(records) == 0:
+                continue
+
+            current_cycle_sigs = set()
+            latest_record = None
+
+            for rec in reversed(records):
+                norm = None
+                if isinstance(rec, list) and len(rec) >= 5:
+                    if rec[0] == "0,0,0,36" or str(rec[0]).startswith("0,0"):
+                        continue
+                    norm = {"Date-and-time": str(rec[0]), "Service": str(rec[3]), "Number": str(rec[2]), "Full_message": str(rec[4])}
+                elif isinstance(rec, dict):
+                    if any(k in rec for k in ["Number", "number", "Full_message", "message"]):
+                        norm = {
+                            "Date-and-time": str(rec.get("Date-and-time") or rec.get("time") or ""),
+                            "Service": str(rec.get("Service") or rec.get("service") or "Unknown"),
+                            "Number": str(rec.get("Number") or rec.get("number") or "N/A"),
+                            "Full_message": str(rec.get("Full_message") or rec.get("message") or "")
+                        }
+
+                if not norm or not norm.get("Number") or norm.get("Number") == "N/A":
+                    continue
+
+                sig = f"{norm.get('Date-and-time')}|{norm.get('Number')}"
+                current_cycle_sigs.add(sig)
+                latest_record = norm
+
+            # Cache baseline sync to avoid duplicate processing later
+            api_records_cache[api_id] = current_cycle_sigs
+
+            # Send exactly 1 test OTP verification card from this API to all existing groups instantly
+            if latest_record and groups_cache:
+                for chat_id in groups_cache:
+                    await send_vip_card_direct(chat_id, latest_record, current_buttons, api_id)
+
+        except Exception as e:
+            logging.error(f"Startup pipeline bypass for API ID {api_id}: Error encountered -> {e}")
+            continue
+
+# ======================== BACKGROUND OTP FETCHER ========================
+async def background_otp_fetcher():
+    while True:
+        try:
+            if apis_cache and groups_cache:
+                current_buttons = [{"name": b["name"], "url": b["url"]} for b in buttons_cache]
+                active_apis = [api for api in apis_cache if api.get("is_active") == 1]
+
+                for api in active_apis:
+                    api_id = api["id"]
+                    try:
+                        # Isolated 5.0s timeout per API to eliminate endless waiting / freezes
+                        r = await http_client.get(api["url"], timeout=5.0)
+                        if r.status_code != 200:
+                            continue
+                        
+                        data = r.json()
+                        records = data.get("aaData", []) if isinstance(data, dict) else data
+                        
+                        if not isinstance(records, list) or len(records) == 0:
+                            continue
+
+                        current_cycle_sigs = set()
+                        new_records_to_send = []
+                        has_valid_format = False
+
+                        for rec in reversed(records):
+                            norm = None
+                            if isinstance(rec, list) and len(rec) >= 5:
+                                if rec[0] == "0,0,0,36" or str(rec[0]).startswith("0,0"):
+                                    continue
+                                norm = {"Date-and-time": str(rec[0]), "Service": str(rec[3]), "Number": str(rec[2]), "Full_message": str(rec[4])}
+                                has_valid_format = True
+                            elif isinstance(rec, dict):
+                                if any(k in rec for k in ["Number", "number", "Full_message", "message"]):
+                                    norm = {
+                                        "Date-and-time": str(rec.get("Date-and-time") or rec.get("time") or ""),
+                                        "Service": str(rec.get("Service") or rec.get("service") or "Unknown"),
+                                        "Number": str(rec.get("Number") or rec.get("number") or "N/A"),
+                                        "Full_message": str(rec.get("Full_message") or rec.get("message") or "")
+                                    }
+                                    has_valid_format = True
+                            
+                            if not norm or not norm.get("Number") or norm.get("Number") == "N/A":
+                                continue
+                            
+                            sig = f"{norm.get('Date-and-time')}|{norm.get('Number')}"
+                            current_cycle_sigs.add(sig)
+                            
+                            if api_id in api_records_cache and sig not in api_records_cache[api_id]:
+                                new_records_to_send.append(norm)
+
+                        if not has_valid_format:
+                            continue
+
+                        if api_id not in api_records_cache:
+                            if new_records_to_send or current_cycle_sigs:
+                                latest_one = new_records_to_send[-1] if new_records_to_send else (norm if 'norm' in locals() and norm else None)
+                                if latest_one:
+                                    for chat_id in groups_cache:
+                                        await send_vip_card_direct(chat_id, latest_one, current_buttons, api_id)
+                            api_records_cache[api_id] = current_cycle_sigs
+                        else:
+                            for new_norm in new_records_to_send:
+                                for chat_id in groups_cache:
+                                    await send_vip_card_direct(chat_id, new_norm, current_buttons, api_id)
+                            api_records_cache[api_id] = current_cycle_sigs
+                        
+                        await asyncio.sleep(0.2)
+                    except Exception as e:
+                        # Safely swallows garbage payloads, JSON errors, or dynamic crashes without stopping the loop
+                        logging.warning(f"Bypassed active error/crash on API ID {api_id}: {e}")
+                        continue
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+# ======================== AUTO GROUP TRACKING (my_chat_member) ========================
+@router.my_chat_member()
+async def on_my_chat_member(update: ChatMemberUpdated):
+    chat_id = str(update.chat.id)
+    if update.new_chat_member.status in ["member", "administrator"]:
+        if chat_id not in groups_cache:
+            groups_cache.append(chat_id)
+            await save_json_async(GROUPS_FILE, groups_cache)
+            await update_linked_channels()
+    elif update.new_chat_member.status in ["left", "kicked"]:
+        if chat_id in groups_cache:
+            groups_cache.remove(chat_id)
+            await save_json_async(GROUPS_FILE, groups_cache)
+            linked_channels_cache.pop(chat_id, None)
+            await save_json_async(LINKED_CHANNELS_FILE, linked_channels_cache)
+
+# ======================== START COMMAND ========================
+@router.message(Command("start"))
+async def start_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"]:
         return
 
-    print(f"[DEBUG-MY_CHAT_MEMBER] Chat: {chat_id}, Old Status: {old_status}, New Status: {new_status}")
+    text = (
+        f"{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}\n"
+        f"{E_CROWN} <b>𝗩𝗜𝗣 𝗢𝗧𝗣 𝗕𝗥𝗢𝗔𝗗𝗖𝗔𝗦𝗧𝗘𝗥</b> {E_CROWN}\n"
+        f"{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}{E_CROWN}\n\n"
+        f"{E_GEAR} <i>Ultra Speed Forwarder System</i> {E_GEAR}\n\n"
+        f"Click below to add me to your groups instantly!\n"
+    )
 
-    if new_status not in ("left", "kicked"):
-        global chats 
-        chats.setdefault(chat_id, {"active": True, "type": "group"}) 
-        if "buttons" not in chats[chat_id] or len(chats[chat_id]["buttons"]) < 2:
-            chats[chat_id]["buttons"] = [
-                {"name": DEFAULT_BUTTON_1_NAME, "url": DEFAULT_BUTTON_1_URL},
-                {"name": DEFAULT_BUTTON_2_NAME, "url": DEFAULT_BUTTON_2_URL},
-            ]
-        await save_chats()
-        print(f"Bot added/promoted in group {chat_id}: {new_status}. Default buttons initialized.")
-    
-    elif old_status not in ("left", "kicked") and new_status in ("left", "kicked"):
-        if chat_id in chats:
-            del chats[chat_id]
-            await save_chats()
-            print(f"Bot removed from group {chat_id}, deleted from chats.json")
+    inline_keyboard = [[{
+        "text": "Add Bot to Your Group",
+        "url": f"https://t.me/RajaOtp1Bot?startgroup=start",
+        "icon_custom_emoji_id": ID_ADD,
+        "style": "primary"
+    }]]
 
+    if message.from_user.id in ADMIN_IDS:
+        inline_keyboard.append([{
+            "text": "Owner Panel",
+            "callback_data": "owner_main",
+            "icon_custom_emoji_id": ID_ADMIN,
+            "style": "primary"
+        }])
 
+    await send_raw_api_message(message.chat.id, text, {"inline_keyboard": inline_keyboard})
 
-def apis_list_markup():
-    kb = []
-    for api in apis:
-        status = "🟢" if api.get("active", True) else "🔴"
-        label = f"API-{api['id']} {status}"
-        kb.append([InlineKeyboardButton(label, callback_data=f"api_details|{api['id']}")])
-    kb.append([InlineKeyboardButton("⬅️ Back to Panel", callback_data="owner_panel")])
-    return InlineKeyboardMarkup(kb)
+# ======================== OWNER PANEL ========================
+@router.callback_query(F.data == "owner_main")
+async def owner_panel(q: CallbackQuery, state: FSMContext):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
 
-def api_details_markup(api_id):
-    api_obj = next((a for a in apis if a["id"] == api_id), None)
-    if not api_obj:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="owner_panel")]])
-        
-    status = api_obj.get("active", True)
-    
-    kb = [
-        [InlineKeyboardButton(f"{'Deactivate 🔴' if status else 'Activate 🟢'}", 
-                              callback_data=f"api_toggle|{api_id}|{'deactivate' if status else 'activate'}")],
-        
-        [InlineKeyboardButton("🗑 Delete API", callback_data=f"api_delete|{api_id}")],
-        
-        [InlineKeyboardButton("⬅️ Back to List", callback_data="owner_list_apis")],
+    inline_keyboard = [
+        [
+            {"text": "Add New API", "callback_data": "adm_add_api", "icon_custom_emoji_id": ID_ADD, "style": "success"},
+            {"text": "Manage APIs", "callback_data": "adm_manage_api", "icon_custom_emoji_id": ID_MANAGE, "style": "primary"}
+        ],
+        [
+            {"text": "Add Custom Button", "callback_data": "adm_add_btn", "icon_custom_emoji_id": ID_ADD, "style": "success"},
+            {"text": "Manage Buttons", "callback_data": "adm_manage_btn", "icon_custom_emoji_id": ID_MANAGE, "style": "primary"}
+        ],
+        [
+            {"text": "Close Menu", "callback_data": "adm_close", "icon_custom_emoji_id": ID_CROSS, "style": "danger"}
+        ]
     ]
-    return InlineKeyboardMarkup(kb)
-    
-async def on_startup(app: Application):
-    print("Bot starting... Ensuring workers and loading saved state.")
-    await ensure_workers(app)
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_CROWN} <b>Welcome Master to Control Hub</b> {E_CROWN}", {"inline_keyboard": inline_keyboard})
 
-def main():
-    if BOT_USERNAME == "YOUR_BOT_USERNAME":
-        print("ERROR: Please update BOT_USERNAME in the CONFIG section!")
+@router.callback_query(F.data == "adm_close")
+async def close_panel(q: CallbackQuery):
+    await q.message.delete()
+
+# ======================== CUSTOM BUTTON MANAGEMENT ========================
+@router.callback_query(F.data == "adm_add_btn")
+async def start_add_btn(q: CallbackQuery, state: FSMContext):
+    if q.from_user.id not in ADMIN_IDS:
         return
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CallbackQueryHandler(callback_query_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
-    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    await state.set_state(BotStates.wait_btn_name)
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_GEAR} Send name for the new custom button:")
 
-    app.post_init = on_startup
-    print("Running bot (PTB version", PTB_VERSION, ")")
-    app.run_polling(allowed_updates=["message", "callback_query", "my_chat_member", "chat_member"])
+@router.message(BotStates.wait_btn_name, F.text)
+async def process_btn_name(message: Message, state: FSMContext):
+    await state.update_data(btn_name=message.text.strip())
+    await state.set_state(BotStates.wait_btn_url)
+    await message.answer(f"{E_CHANNEL} Now send the destination URL / Link for this button:")
+
+@router.message(BotStates.wait_btn_url, F.text)
+async def process_btn_url(message: Message, state: FSMContext):
+    url_text = message.text.strip()
+    if not (url_text.startswith("http://") or url_text.startswith("https://")):
+        await message.answer(f"{E_CROSS} Invalid URL format. Provide link starting with http/https.")
+        return
+    data = await state.get_data()
+    btn_name = data.get("btn_name")
+    new_id = max([b["id"] for b in buttons_cache], default=0) + 1
+    buttons_cache.append({"id": new_id, "name": btn_name, "url": url_text})
+    await save_json_async(BUTTONS_FILE, buttons_cache)
+    await state.clear()
+    inline_keyboard = [[{"text": "Back to Menu", "callback_data": "owner_main", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]]
+    await send_raw_api_message(message.chat.id, f"{E_TICK} <b>Button saved successfully!</b>\nName: {btn_name}\nLink: {url_text}", {"inline_keyboard": inline_keyboard})
+
+@router.callback_query(F.data == "adm_manage_btn")
+async def manage_buttons(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    if not buttons_cache:
+        await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_CROSS} No custom buttons found.", {"inline_keyboard": [[{"text": "Back", "callback_data": "owner_main", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]]})
+        return
+    inline_keyboard = []
+    for row in buttons_cache:
+        inline_keyboard.append([{"text": row['name'], "callback_data": f"view_btn_{row['id']}", "icon_custom_emoji_id": ID_MANAGE, "style": "primary"}])
+    inline_keyboard.append([{"text": "Back", "callback_data": "owner_main", "icon_custom_emoji_id": ID_BACK, "style": "danger"}])
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_GEAR} Select custom button to modify:", {"inline_keyboard": inline_keyboard})
+
+@router.callback_query(F.data.startswith("view_btn_"))
+async def view_button_details(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    btn_id = int(q.data.split("_")[2])
+    btn = next((b for b in buttons_cache if b["id"] == btn_id), None)
+    if not btn:
+        return
+    text = f"<b>Button Details:</b>\n\n<b>Name:</b> {btn['name']}\n<b>Link:</b> <code>{btn['url']}</code>"
+    inline_keyboard = [
+        [{"text": "Delete Button", "callback_data": f"del_btn_{btn['id']}", "icon_custom_emoji_id": ID_TRASH, "style": "danger"}],
+        [{"text": "Back", "callback_data": "adm_manage_btn", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]
+    ]
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, text, {"inline_keyboard": inline_keyboard})
+
+@router.callback_query(F.data.startswith("del_btn_"))
+async def delete_button(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    btn_id = int(q.data.split("_")[2])
+    global buttons_cache
+    buttons_cache = [b for b in buttons_cache if b["id"] != btn_id]
+    await save_json_async(BUTTONS_FILE, buttons_cache)
+    inline_keyboard = [[{"text": "Back", "callback_data": "adm_manage_btn", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]]
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_TICK} Button deleted successfully!", {"inline_keyboard": inline_keyboard})
+
+# ======================== API MANAGEMENT ========================
+@router.callback_query(F.data == "adm_add_api")
+async def start_add_api(q: CallbackQuery, state: FSMContext):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(BotStates.wait_api_name)
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_GEAR} Send custom identification name for this new API:")
+
+@router.message(BotStates.wait_api_name, F.text)
+async def process_api_name(message: Message, state: FSMContext):
+    await state.update_data(api_name=message.text.strip())
+    await state.set_state(BotStates.wait_api_url)
+    await message.answer(f"{E_CHANNEL} Now send the JSON Endpoint URL for this pipeline:")
+
+@router.message(BotStates.wait_api_url, F.text)
+async def process_api_url(message: Message, state: FSMContext):
+    url_text = message.text.strip()
+    if not (url_text.startswith("http://") or url_text.startswith("https://")):
+        await message.answer(f"{E_CROSS} Provide valid link starting with http/https.")
+        return
+    data = await state.get_data()
+    api_name = data.get("api_name")
+    new_id = max([a["id"] for a in apis_cache], default=0) + 1
+    apis_cache.append({"id": new_id, "name": api_name, "url": url_text, "is_active": 1})
+    await save_json_async(APIS_FILE, apis_cache)
+    await state.clear()
+    inline_keyboard = [[{"text": "Back to Menu", "callback_data": "owner_main", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]]
+    await send_raw_api_message(message.chat.id, f"{E_TICK} <b>Pipeline saved successfully!</b>\nIdentifier Name: {api_name}", {"inline_keyboard": inline_keyboard})
+
+@router.callback_query(F.data == "adm_manage_api")
+async def manage_apis(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    if not apis_cache:
+        await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_CROSS} No APIs found.", {"inline_keyboard": [[{"text": "Back", "callback_data": "owner_main", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]]})
+        return
+    inline_keyboard = []
+    for row in apis_cache:
+        status_emoji = ID_TICK if row['is_active'] == 1 else ID_CROSS
+        status_style = "success" if row['is_active'] == 1 else "danger"
+        inline_keyboard.append([{"text": row['name'], "callback_data": f"api_view_{row['id']}", "icon_custom_emoji_id": status_emoji, "style": status_style}])
+    inline_keyboard.append([{"text": "Back", "callback_data": "owner_main", "icon_custom_emoji_id": ID_BACK, "style": "primary"}])
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, f"{E_GEAR} System Dynamic Pipelines:", {"inline_keyboard": inline_keyboard})
+
+@router.callback_query(F.data.startswith("api_view_"))
+async def view_api_details(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    api_id = int(q.data.split("_")[2])
+    api = next((a for a in apis_cache if a["id"] == api_id), None)
+    if not api:
+        return
+    status_str = "Active" if api['is_active'] == 1 else "Deactivated"
+    text = f"<b>Pipeline Details:</b>\n\nName: <b>{api['name']}</b>\nURL: <code>{api['url']}</code>\nStatus: {status_str}"
+    inline_keyboard = [
+        [
+            {"text": "Toggle State", "callback_data": f"api_tog_{api['id']}", "icon_custom_emoji_id": ID_TOGGLE, "style": "primary"},
+            {"text": "Delete API", "callback_data": f"api_del_{api['id']}", "icon_custom_emoji_id": ID_TRASH, "style": "danger"}
+        ],
+        [{"text": "Back", "callback_data": "adm_manage_api", "icon_custom_emoji_id": ID_BACK, "style": "primary"}]
+    ]
+    await edit_raw_api_message(q.message.chat.id, q.message.message_id, text, {"inline_keyboard": inline_keyboard})
+
+@router.callback_query(F.data.startswith("api_tog_"))
+async def toggle_api(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    api_id = int(q.data.split("_")[2])
+    for api in apis_cache:
+        if api["id"] == api_id:
+            api["is_active"] = 0 if api["is_active"] == 1 else 1
+            break
+    await save_json_async(APIS_FILE, apis_cache)
+    await view_api_details(q)
+
+@router.callback_query(F.data.startswith("api_del_"))
+async def delete_api(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    api_id = int(q.data.split("_")[2])
+    global apis_cache
+    apis_cache = [a for a in apis_cache if a["id"] != api_id]
+    await save_json_async(APIS_FILE, apis_cache)
+    if api_id in api_records_cache:
+        del api_records_cache[api_id]
+    await manage_apis(q)
+
+# ======================== BACKGROUND TASKS ========================
+async def background_linked_updater():
+    while True:
+        try:
+            await update_linked_channels()
+            await verify_groups_presence()
+        except Exception:
+            pass
+        await asyncio.sleep(1800)  # Routine check every 30 minutes
+
+# ======================== MAIN RUNNER ========================
+async def main():
+    init_all_json_storage()
+    dp.include_router(router)
+    
+    # 1. Start execution flow with instant API Hit and verification broadcast
+    await check_apis_on_startup()
+    
+    # 2. Fire continuous workers
+    asyncio.create_task(background_otp_fetcher())
+    asyncio.create_task(background_linked_updater())
+    
+    print("🚀 Bot is running with 30-min group verification and full error shielding...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
