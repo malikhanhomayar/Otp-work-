@@ -522,7 +522,7 @@ async def start_cmd(message: Message):
 
     inline_keyboard = [[{
         "text": "Add Bot to Your Group",
-        "url": f"https://t.me/RajaOtp1Bot?startgroup=start",
+        "url": f"https://t.me/ZREOFLEX_bot?startgroup=start",
         "icon_custom_emoji_id": ID_ADD,
         "style": "primary"
     }]]
